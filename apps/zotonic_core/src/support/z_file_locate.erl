@@ -69,8 +69,9 @@ extract_filters(Path, OptFilters, Context) ->
                                 _ -> OptFilters
                             end,
                             {SafePath, z_convert:to_binary(OriginalFile), Filters1 ++ PreviewPropList};
-                        {error, _} ->
-                            {SafePath, SafePath, OptFilters}
+                        {error, Reason} ->
+                            lager:info("Dropping path ~p because error ~p", [ SafePath, Reason ]),
+                            part_missing(Path)
                     end
             end
     end.
@@ -92,6 +93,8 @@ locate_source([ModuleIndex|Roots], Path, OriginalFile, Filters, Context) when is
     case locate_source_module_indexer(ModuleIndex, Path, OriginalFile, Filters, Context) of
         {ok, Loc} ->
             Loc;
+        {error, checksum} ->
+            #part_missing{file = Path};
         {error, eacces} ->
             lager:info("No access to file '~s', original '~s'", [Path, OriginalFile]),
             locate_source(Roots, Path, OriginalFile, Filters, Context);

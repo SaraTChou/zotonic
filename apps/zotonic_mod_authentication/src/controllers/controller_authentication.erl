@@ -52,9 +52,23 @@ content_types_provided(Context) ->
     ], Context}.
 
 process(<<"POST">>, AcceptedCT, ProvidedCT, Context) ->
-    {Payload, Context1} = z_controller_helper:decode_request(AcceptedCT, Context),
-    {Result, Context2} = handle_cmd( maps:get(<<"cmd">>, Payload, undefined), Payload, Context1 ),
-    {z_controller_helper:encode_response(ProvidedCT, Result), Context2}.
+    case fetch_body(AcceptedCT, Context) of
+        {ok, {Payload, Context1}} ->
+            {Result, Context2} = handle_cmd( maps:get(<<"cmd">>, Payload, undefined), Payload, Context1 ),
+            {z_controller_helper:encode_response(ProvidedCT, Result), Context2};
+        {error, timeout} ->
+            {{halt, 500}, Context}
+    end.
+
+fetch_body(AcceptedCT, Context) ->
+    try
+        Ret = z_controller_helper:decode_request(AcceptedCT, Context),
+        {ok, Ret}
+    catch
+        exit:timeout ->
+            % Timeout reading the request body
+            {error, timeout}
+    end.
 
 -spec handle_cmd( binary(), map(), z:context() ) -> { map(), z:context() }.
 handle_cmd(<<"logon">>, Payload, Context) ->
@@ -89,7 +103,8 @@ handle_cmd(Cmd, _Payload, Context) ->
 
 -spec logon( map(), z:context() ) -> { map(), z:context() }.
 logon(Payload, Context) ->
-    logon_1(z_notifier:first(#logon_submit{ payload = Payload }, Context), Payload, Context).
+    {Result, Context1} = logon_1(z_notifier:first(#logon_submit{ payload = Payload }, Context), Payload, Context),
+    maybe_add_logon_options(Result, Payload, Context1).
 
 logon_1({ok, UserId}, Payload, Context) when is_integer(UserId) ->
     case z_auth:logon(UserId, Context) of
@@ -134,8 +149,42 @@ logon_1({error, _Reason}, _Payload, Context) ->
     % Hide other error codes, map to generic 'pw' error
     { #{ status => error, error => pw }, Context };
 logon_1(undefined, _Payload, Context) ->
-    lager:warning("Authentication error: #logon_submit{} returned undefined."),
     { #{ status => error, error => pw }, Context }.
+
+-spec maybe_add_logon_options( map(), map(), z:context() ) -> { map(), z:context() }.
+maybe_add_logon_options(#{ error := ratelimit } = Result, _Payload, Context) ->
+    {Result, Context};
+maybe_add_logon_options(#{ status := error } = Result, Payload, Context) ->
+    Options = #{
+        is_username_checked => false,
+        is_user_local => false,
+        is_user_external => false,
+        username => maps:get(<<"username">>, Payload, undefined),
+        user_external => [],
+        page => maps:get(<<"page">>, Payload, undefined),
+        is_password_entered => not z_utils:is_empty(maps:get(<<"password">>, Payload, <<>>))
+    },
+    Options1 = z_notifier:foldr(#logon_options{ payload = Payload }, Options, Context),
+    Result1 = Result#{
+        options => Options1
+    },
+    case Options1 of
+        #{ is_user_external := true } -> {Result1, Context};
+        #{ is_user_local := true } -> {Result1, Context};
+        #{ is_user_local := false, is_user_external := false, username := Username }
+            when is_binary(Username), Username =/= <<>> ->
+            % Hide the fact an user is unknown, this prevents fishing for known usernames.
+            Options2 = Options1#{
+                is_user_local => true,
+                is_username_checked => true
+            },
+            {Result1#{ options => Options2 }, Context};
+        _ ->
+            {Result1, Context}
+    end;
+maybe_add_logon_options(#{ status := ok } = Result, _Payload, Context) ->
+    {Result, Context}.
+
 
 -spec onetime_token( map(), z:context() ) -> { map(), z:context() }.
 onetime_token(#{ <<"token">> := Token } = Payload, Context) ->
@@ -151,7 +200,8 @@ onetime_token(_Payload, Context) ->
 -spec switch_user( map(), z:context() ) -> { map(), z:context() }.
 switch_user(#{ <<"user_id">> := UserId } = Payload, Context) when is_integer(UserId) ->
     AuthOptions = z_context:get(auth_options, Context, #{}),
-    case z_auth:logon_switch(UserId, Context) of
+    SudoUserId = maps:get(sudo_user_id, AuthOptions, z_acl:user(Context)),
+    case z_auth:logon_switch(UserId, SudoUserId, Context) of
         {ok, Context1} ->
             z:warning(
                 "Sudo as user ~p (~s) by user ~p (~s)",
@@ -163,7 +213,11 @@ switch_user(#{ <<"user_id">> := UserId } = Payload, Context) when is_integer(Use
                     {module, ?MODULE}, {line, ?LINE}, {auth_user_id, UserId}
                 ],
                 Context),
-            Context2 = z_authentication_tokens:set_auth_cookie(UserId, AuthOptions, Context1),
+            Options1 = maps:remove(sid,AuthOptions),
+            Options2 = Options1#{
+                sudo_user_id => SudoUserId
+            },
+            Context2 = z_authentication_tokens:set_auth_cookie(UserId, Options2, Context1),
             return_status(Payload, Context2);
         {error, _Reason} ->
             { #{ status => error, error => eacces }, Context }

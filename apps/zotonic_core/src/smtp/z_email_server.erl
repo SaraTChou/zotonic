@@ -73,7 +73,7 @@
 -record(email_sender, {id, sender_pid, domain, is_connected=false}).
 
 
--type delivery_type() :: permanent_failure | temporary_failure | sent | received.
+-type delivery_type() :: permanent_failure | temporary_failure | sent | received | relayed.
 -export_type([ delivery_type/0 ]).
 
 
@@ -337,7 +337,6 @@ handle_cast({delivery_report, What, OptRecipient, MsgIdHeader, OptStatusMessage}
     % Find the original message in our database of recent sent e-mail
     TrFun = fun()->
                     [QEmail] = mnesia:read(email_queue, MsgId),
-                    mnesia:delete_object(QEmail),
                     {(QEmail#email_queue.email)#email.to, QEmail#email_queue.pickled_context}
             end,
     case mnesia:transaction(TrFun) of
@@ -445,9 +444,10 @@ handle_delivery_report(temporary_failure, MsgId, Recipient, OptMessage, Context)
                     props = []
                 }
           }, Context);
-handle_delivery_report(sent, MsgId, Recipient, OptMessage, Context) ->
-    lager:info("[smtp] Success sending email to ~p (~p): sent",
-               [Recipient, MsgId]),
+handle_delivery_report(Status, MsgId, Recipient, OptMessage, Context)
+    when Status =:= sent; Status =:= relayed ->
+    lager:info("[smtp] Success sending email to ~p (~p): ~p",
+               [Recipient, MsgId, Status]),
     z_notifier:notify(#email_sent{
             message_nr = MsgId,
             recipient = Recipient,
@@ -458,7 +458,7 @@ handle_delivery_report(sent, MsgId, Recipient, OptMessage, Context) ->
             props = #log_email{
                     severity = ?LOG_INFO,
                     message_nr = MsgId,
-                    mailer_status = sent,
+                    mailer_status = Status,
                     mailer_message = OptMessage,
                     envelop_to = Recipient,
                     envelop_from = "<>",
@@ -566,10 +566,9 @@ reply_email(MessageId, Context) when is_binary(MessageId) ->
 
 % The 'From' is either the message id (and bounce domain) or the set from.
 get_email_from(EmailFrom, VERP, State, Context) ->
-    From = case EmailFrom of
-        L when L =:= [] orelse L =:= undefined orelse L =:= <<>> ->
-            get_email_from(Context);
-        _ -> EmailFrom
+    From = case z_convert:to_binary(EmailFrom) of
+        <<>> -> get_email_from(Context);
+        L -> L
     end,
     {FromName, FromEmail} = z_email:split_name_email(From),
     case State#state.smtp_verp_as_from of
@@ -584,12 +583,12 @@ get_email_from(EmailFrom, VERP, State, Context) ->
 % When the 'From' is not the VERP then the 'From' is derived from the site
 get_email_from(Context) ->
     %% Let the default be overruled by the config setting
-    case m_config:get_value(site, email_from, Context) of
-        undefined ->
+    case z_convert:to_binary( m_config:get_value(site, email_from, Context) ) of
+        <<>>  ->
             EmailDomain = z_email:email_domain(Context),
             <<"noreply@", EmailDomain/binary>>;
         EmailFrom ->
-            z_convert:to_binary(EmailFrom)
+            EmailFrom
     end.
 
 % Unique message-id, depends on bounce domain
@@ -704,38 +703,36 @@ spawn_send_checked(Id, Recipient, Email, RetryCt, Context, State) ->
                 {hostname, z_convert:to_list(z_email:email_domain(Context))},
                 {timeout, ?SMTP_CONNECT_TIMEOUT},
                 {tls_options, [{versions, ['tlsv1.2']}]}
-                | case State#state.smtp_relay of
-                    true -> State#state.smtp_relay_opts;
-                    false -> [{relay, z_convert:to_list(RecipientDomain)}]
-                  end
-            ],
+            ] ++ case relay_site_options(State, Context) of
+                {true, RelayOpts} -> RelayOpts;
+                false -> [{relay, z_convert:to_list(RecipientDomain)}]
+            end,
             BccSmtpOpts = case z_utils:is_empty(State#state.smtp_bcc) of
-                              true ->
-                                    [];
-                              false ->
-                                    {_BccName, BccEmail} = z_email:split_name_email(State#state.smtp_bcc),
-                                    [_BccLocalName, BccDomain] = binary:split(BccEmail, <<"@">>),
-                                    [
-                                        {no_mx_lookups, State#state.smtp_no_mx_lookups},
-                                        {hostname, z_convert:to_list(z_email:email_domain(Context))},
-                                        {timeout, ?SMTP_CONNECT_TIMEOUT},
-                                        {tls_options, [{versions, ['tlsv1.2']}]}
-                                        | case State#state.smtp_relay of
-                                            true -> State#state.smtp_relay_opts;
-                                            false -> [{relay, z_convert:to_list(BccDomain)}]
-                                          end
-                                    ]
-                          end,
+                true ->
+                    [];
+                false ->
+                    {_BccName, BccEmail} = z_email:split_name_email(State#state.smtp_bcc),
+                    [_BccLocalName, BccDomain] = binary:split(BccEmail, <<"@">>),
+                    [
+                        {no_mx_lookups, State#state.smtp_no_mx_lookups},
+                        {hostname, z_convert:to_list(z_email:email_domain(Context))},
+                        {timeout, ?SMTP_CONNECT_TIMEOUT},
+                        {tls_options, [{versions, ['tlsv1.2']}]}
+                    ] ++ case relay_site_options(State, Context) of
+                        {true, BccRelayOpts} -> BccRelayOpts;
+                        false -> [{relay, z_convert:to_list(BccDomain)}]
+                    end
+            end,
             MessageId = message_id(Id, Context),
             VERP = bounce_email(MessageId, Context),
             From = get_email_from(Email#email.from, VERP, State, Context),
             SenderPid = erlang:spawn_link(
-                            fun() ->
-                                spawned_email_sender(
-                                        Id, MessageId, Recipient, RecipientEmail, <<"<", VERP/binary, ">">>,
-                                        From, State#state.smtp_bcc, Email, SmtpOpts, BccSmtpOpts,
-                                        RetryCt, Context)
-                            end),
+                fun() ->
+                    spawned_email_sender(
+                            Id, MessageId, Recipient, RecipientEmail, <<"<", VERP/binary, ">">>,
+                            From, State#state.smtp_bcc, Email, SmtpOpts, BccSmtpOpts,
+                            RetryCt, Context)
+                end),
             {relay, Relay} = proplists:lookup(relay, SmtpOpts),
             State#state{
                     sending=[
@@ -744,6 +741,46 @@ spawn_send_checked(Id, Recipient, Email, RetryCt, Context, State) ->
         true ->
             drop_blocked_email(Id, RecipientEmail, Email, Context),
             State
+    end.
+
+%% @doc Fetch the SMTP relay options, if the Zotonic system is configured to use a relay
+%% then that relay is always used. Otherwise the relay configuration of the site is used.
+relay_site_options(#state{ smtp_relay = true } = State, _Context) ->
+    {true, State#state.smtp_relay_opts};
+relay_site_options(_State, Context) ->
+    case m_config:get_boolean(site, smtp_relay, Context) of
+        true ->
+            SmtpHost = case z_convert:to_binary( m_config:get_value(site, smtp_relay_host, Context) ) of
+                <<>> -> "localhost";
+                SHost -> z_convert:to_list(SHost)
+            end,
+            Port = case z_convert:to_binary( m_config:get_value(site, smtp_relay_port, Context) ) of
+                <<>> -> 25;
+                SPort ->
+                    try
+                        z_convert:to_integer(SPort)
+                    catch
+                        _:_ -> 25
+                    end
+            end,
+            SSL = m_config:get_boolean(site, smtp_relay_ssl, Context),
+            Creds = case z_convert:to_binary( m_config:get_value(site, smtp_relay_username, Context) ) of
+                <<>> ->
+                    [];
+                Username ->
+                    [
+                        {auth, always},
+                        {username, z_convert:to_list(Username)},
+                        {password, z_convert:to_list(m_config:get_value(site, smtp_relay_password, Context))}
+                    ]
+            end,
+            {true, [
+                {relay, SmtpHost},
+                {port, Port},
+                {ssl, SSL}
+            ] ++ Creds};
+        false ->
+            false
     end.
 
 spawned_email_sender(Id, MessageId, Recipient, RecipientEmail, VERP, From,
@@ -928,7 +965,7 @@ encode_email(Id, #email{body=undefined} = Email, MessageId, From, Context) ->
                           Sub
                   end,
     Headers = [{<<"From">>, From},
-               {<<"To">>, Email#email.to},
+               {<<"To">>, ensure_brackets(Email#email.to)},
                {<<"Subject">>, iolist_to_binary(Subject)},
                {<<"Date">>, date(Context)},
                {<<"MIME-Version">>, <<"1.0">>},
@@ -939,7 +976,7 @@ encode_email(Id, #email{body=undefined} = Email, MessageId, From, Context) ->
     build_and_encode_mail(Headers2, Text, Html, Email#email.attachments, Context);
 encode_email(Id, #email{body=Body} = Email, MessageId, From, Context) when is_tuple(Body) ->
     Headers = [{<<"From">>, From},
-               {<<"To">>, Email#email.to},
+               {<<"To">>, ensure_brackets(Email#email.to)},
                {<<"Message-ID">>, MessageId},
                {<<"X-Mailer">>, x_mailer()}
                 | Email#email.headers ],
@@ -951,12 +988,23 @@ encode_email(Id, #email{body=Body} = Email, MessageId, From, Context) when is_tu
     mimemail:encode({BodyType, BodySubtype, MailHeaders, BodyParams, BodyParts}, opt_dkim(Context));
 encode_email(Id, #email{body=Body} = Email, MessageId, From, Context) when is_list(Body); is_binary(Body) ->
     Headers = [{<<"From">>, From},
-               {<<"To">>, Email#email.to},
+               {<<"To">>, ensure_brackets(Email#email.to)},
                {<<"Message-ID">>, MessageId},
                {<<"X-Mailer">>, x_mailer()}
                 | Email#email.headers ],
     Headers2 = add_reply_to(Id, Email, add_cc(Email, Headers), Context),
     iolist_to_binary([ encode_headers(Headers2), "\r\n\r\n", Body ]).
+
+ensure_brackets(Email) when is_binary(Email) ->
+    case binary:match(Email, <<"<">>) of
+        {_,_} ->
+            Email;
+        nomatch ->
+            [ Name | _ ] = binary:split(Email, <<"@">>),
+            <<Name/binary, " <", Email/binary, $>>>
+    end;
+ensure_brackets(Email) ->
+    ensure_brackets(z_convert:to_binary(Email)).
 
 date(Context) ->
     iolist_to_binary(z_datetime:format("r", z_context:set_language(en, Context))).

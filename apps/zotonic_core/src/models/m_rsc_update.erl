@@ -355,7 +355,7 @@ flush(Id, CatList, Context) ->
 duplicate(Id, DupProps, Context) when is_list(DupProps) ->
     {ok, DupMap} = z_props:from_list(DupProps),
     duplicate(Id, DupMap, Context);
-duplicate(Id, DupProps, Context) ->
+duplicate(Id, DupProps, Context) when is_integer(Id) ->
     case z_acl:rsc_visible(Id, Context) of
         true ->
             case m_rsc:get_raw(Id, Context) of
@@ -394,7 +394,11 @@ duplicate(Id, DupProps, Context) ->
             end;
         false ->
             {error, eacces}
-    end.
+    end;
+duplicate(undefined, _DupProps, _Context) ->
+    {error, enoent};
+duplicate(Id, DupProps, Context) ->
+    duplicate(m_rsc:rid(Id, Context), DupProps, Context).
 
 %% @doc Update a resource
 -spec update(
@@ -502,7 +506,7 @@ update_editable_check(#rscupd{id = Id, is_acl_check = true} = RscUpd, PropsOrFun
         true ->
             update_normalize_props(RscUpd, PropsOrFun, Context);
         false ->
-            case m_rsc:p(Id, is_authoritative, Context) of
+            case m_rsc:p_no_acl(Id, is_authoritative, Context) of
                 false -> {error, non_authoritative};
                 true -> {error, eacces}
             end
@@ -657,26 +661,36 @@ update_transaction_fun_insert(#rscupd{id = insert_rsc} = RscUpd, Props, _Raw, Up
     % Allow the initial insertion props to be modified.
     CategoryId = z_convert:to_integer(maps:get(<<"category_id">>, Props)),
     InitProps = #{
+        <<"version">> => 0,
         <<"category_id">> => CategoryId,
-        <<"version">> => 0
+        <<"content_group_id">> => maps:get(<<"content_group_id">>, Props, undefined)
     },
     InsProps = z_notifier:foldr(#rsc_insert{ props = Props }, InitProps, Context),
 
-    % Check if the user is allowed to create the resource
+    % Create dummy resource with correct creator, category and content group.
+    % This resource will be updated with the other properties.
     InsertId = case maps:get(<<"creator_id">>, UpdateProps, undefined) of
                    self ->
-                       {ok, InsId} = z_db:insert(
+                        {ok, InsId} = z_db:insert(
                             rsc,
                             InsProps#{ <<"creator_id">> => undefined },
                             Context),
-                       1 = z_db:q("update rsc set creator_id = id where id = $1", [InsId], Context),
-                       InsId;
+                        1 = z_db:q("update rsc set creator_id = id where id = $1", [InsId], Context),
+                        InsId;
                    CreatorId when is_integer(CreatorId) ->
-                       {ok, InsId} = z_db:insert(
-                            rsc,
-                            InsProps#{ <<"creator_id">> => CreatorId },
-                            Context),
-                       InsId;
+                        {ok, InsId} = case z_acl:is_admin(Context) of
+                            true ->
+                                z_db:insert(
+                                    rsc,
+                                    InsProps#{ <<"creator_id">> => CreatorId },
+                                    Context);
+                            false ->
+                                z_db:insert(
+                                    rsc,
+                                    InsProps#{ <<"creator_id">> => z_acl:user(Context) },
+                                    Context)
+                        end,
+                        InsId;
                    undefined ->
                        {ok, InsId} = z_db:insert(
                             rsc,
@@ -756,17 +770,22 @@ update_transaction_fun_db(RscUpd, Id, Props, Raw, IsABefore, IsCatInsert, Contex
     IsInsert = (RscUpd#rscupd.id =:= insert_rsc),
     UpdateProps1 = set_if_normal_update(RscUpd, <<"modified">>, erlang:universaltime(), UpdateProps),
     UpdateProps2 = set_if_normal_update(RscUpd, <<"modifier_id">>, z_acl:user(Context), UpdateProps1),
-    {IsForceUpdate, UpdatePropsN} = z_notifier:foldr(#rsc_update{
-                                            action = case IsInsert of
-                                                        true -> insert;
-                                                        false -> update
-                                                     end,
-                                            id = Id,
-                                            props = Raw
-                                        },
-                                        {IsInsert, UpdateProps2},
-                                        Context),
+    UpdResult = z_notifier:foldr(
+        #rsc_update{
+            action = case IsInsert of
+                        true -> insert;
+                        false -> update
+                     end,
+            id = Id,
+            props = Raw
+        },
+        {ok, UpdateProps2},
+        Context),
+    update_transaction_fun_db_1(UpdResult, Id, RscUpd, Raw, IsABefore, IsCatInsert, Context).
 
+update_transaction_fun_db_1({error, _} = Error, _Id, _RscUpd, _Raw, _IsABefore, _IsCatInsert, _Context) ->
+    Error;
+update_transaction_fun_db_1({ok, UpdatePropsN}, Id, RscUpd, Raw, IsABefore, IsCatInsert, Context) ->
     % Pre-pivot of the category-id to the category sequence nr.
     UpdatePropsN1 = case maps:get(<<"category_id">>, UpdatePropsN, undefined) of
                         undefined ->
@@ -809,18 +828,28 @@ update_transaction_fun_db(RscUpd, Id, Props, Raw, IsABefore, IsCatInsert, Contex
     NewPropsDiff = diff(NewPropsLangPruned, Raw),
 
     % 6. Perform optional update, check diff
-    case       RscUpd#rscupd.id =:= insert_rsc
-        orelse IsForceUpdate
-        orelse is_changed(Raw, NewPropsDiff)
-    of
+    IsInsert = (RscUpd#rscupd.id =:= insert_rsc),
+    case is_update_allowed(IsInsert, Id, NewPropsLangPruned, Context) of
         true ->
-            UpdatePropsPrePivoted = z_pivot_rsc:pivot_resource_update(Id, NewPropsDiff, Raw, Context),
-            {ok, 1} = z_db:update(rsc, Id, UpdatePropsPrePivoted, Context),
-            ok = update_page_path_log(Id, Raw, NewPropsDiff, Context),
-            {ok, Id, Raw, NewPropsDiff, IsABefore, IsCatInsert};
+            case (IsInsert orelse is_changed(Raw, NewPropsDiff)) of
+                true ->
+                    UpdatePropsPrePivoted = z_pivot_rsc:pivot_resource_update(Id, NewPropsDiff, Raw, Context),
+                    {ok, 1} = z_db:update(rsc, Id, UpdatePropsPrePivoted, Context),
+                    ok = update_page_path_log(Id, Raw, NewPropsDiff, Context),
+                    NewPropsFinal = maps:merge(NewPropsLangPruned, UpdatePropsPrePivoted),
+                    {ok, Id, Raw, NewPropsFinal, IsABefore, IsCatInsert};
+                false ->
+                    {ok, Id, notchanged}
+            end;
         false ->
-            {ok, Id, notchanged}
+            {error, eacces}
     end.
+
+is_update_allowed(true, Id, NewProps, Context) ->
+    z_acl:is_allowed(insert, #acl_rsc{ id = Id, props = NewProps }, Context);
+is_update_allowed(false, Id, NewProps, Context) ->
+    z_acl:is_allowed(update, #acl_rsc{ id = Id, props = NewProps }, Context).
+
 
 maybe_set_langs(#{ <<"language">> := Langs } = Props, NewLangs) when is_list(Langs) ->
     case Langs of

@@ -1,7 +1,12 @@
 {% javascript %}
-	$('.tree-list .active').removeClass('active');
-	$('.tree-list div[data-page-id="{{ id }}"]').addClass('active');
-	$('#save-buttons').hide().fadeIn();
+	$('.tree-list .active')
+		.removeClass('active');
+	$('.tree-list div[data-page-id="{{ id }}"]')
+		.closest('.menu-item')
+		.addClass('active');
+	$('#save-buttons')
+		.hide()
+		.fadeIn();
 {% endjavascript %}
 
 {% block tinymce_init %}
@@ -10,6 +15,7 @@
 
 {% block rscform %}
 
+{% with id.is_editable as is_editable %}
 {% with id.is_a|default:(m.category[cat].is_a) as cats %}
 {% wire id="rscform"
 		type="submit"
@@ -83,10 +89,24 @@
 		</div>
 		{% block meta_panels %}{% endblock %}
 		<div class="tab-pane" id="meta-language">
-			{% optional include "_translation_edit_languages.tpl" %}
+			<div class="widget">
+			    <div class="widget-header">
+			        {_ Language _}
+			    </div>
+			    <div class="widget-content">
+					{% optional include "_translation_edit_languages.tpl" %}
+				</div>
+			</div>
 		</div>
 		<div class="tab-pane" id="meta-acl">
-			{% optional include "_admin_edit_visible_for.tpl" id=id is_admin_frontend %}
+			<div class="widget">
+			    <div class="widget-header">
+			        {_ Access control _}
+			    </div>
+			    <div class="widget-content">
+					{% optional include "_admin_edit_visible_for.tpl" id=id is_admin_frontend %}
+				</div>
+			</div>
 		</div>
 	</div>
 
@@ -109,6 +129,7 @@
 		{% endblock %}
 	</div>
 </form>
+{% endwith %}
 {% endwith %}
 
 {% javascript %}
